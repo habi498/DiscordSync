@@ -6,14 +6,20 @@ Since, the curl libraries included are compiled with MSVC, you need the same com
 
 How to compile in windows?
 ---------------------------
-You can either open the folder( containing CMakelists.txt) in Visual studio. (Inside Visual Studio, File->Open Folder->..) or open a command prompt and browse to the directory containing CMakelists.txt and:
+1. Using Visual Studio
+Open the folder( containing CMakelists.txt) in Visual studio. (Inside Visual Studio, File->Open Folder->..). Then it will be opened as a CMake Project.
+There will be 4 main configurations: WINDOWS_32, WINDOWS_64, WSL_GCC_32, WSL_GCC_64. The latter two are for compiling using WSL installed. To compile windows plugins, select WINDOWS_64 or WINDOWS_32 as the case may be.
+Finally, Build using Build->Build All
 
+2. Using Command Prompt
+
+open a command prompt and browse to the directory containing CMakelists.txt and:
 mkdir out
 cd out
 cmake ../ -DCURL_LIBRARY=../libcurl-x64 -DCURL_INCLUDE_DIR=../curl 
 cmake --build . --config Release
 
-For compiling 32-bit build on 64-bit windows, it will be:
+2. (a) For compiling 32-bit build on 64-bit windows, it will be:
 mkdir out
 cd out
 cmake ../ -DCURL_LIBRARY=../libcurl-x86 -DCURL_INCLUDE_DIR=../curl -DCMAKE_GENERATOR_PLATFORM=Win32
@@ -32,7 +38,7 @@ cmake --build . config --Release
 
 This will build discordsync04rel64.so and copy it to out/binaries
 
-If you want to build for 32 bit systems:
+If you want to build for 32 bit systems: (on 32 bit system )
 mkdir out
 cd out
 cmake ../ -DCURL_LIBRARY=libcurl-x86.a -DOPENSSL=libssl-x86.a -DCRYPTO=libcrypto-x86.a 

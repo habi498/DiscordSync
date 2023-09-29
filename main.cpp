@@ -446,11 +446,14 @@ void DiscordSync_CloseConnection()
 	}
 }
 static int recv_any(CURL* curl) {
-	size_t rlen;
+	size_t rlen;size_t total_len=0;
 	const struct curl_ws_frame* meta;
-	char buffer[4096];
-	CURLcode result = curl_ws_recv(curl, buffer, sizeof(buffer), &rlen, &meta);
-	if (result != CURLE_OK) {
+	char buffer[4096];std::string data="";CURLcode result;
+	do
+	{
+	result = curl_ws_recv(curl, buffer, sizeof(buffer), &rlen, &meta);
+		if (result != CURLE_OK) 
+		{
 		if (result == CURLE_GOT_NOTHING)
 		{
 			LogMessageEx("[DiscordSync] Disconnected. (CURLE_GOT_NOTHING)");
@@ -494,7 +497,11 @@ static int recv_any(CURL* curl) {
 		}
 		return result;//curle_again, so return.
 	}
-	std::string data = std::string(buffer, rlen);
+	data += std::string(buffer, rlen);
+	total_len+=rlen;
+	}
+	while(meta->bytesleft>0);
+    
 	bool resumable;
 	if (meta->flags & CURLWS_TEXT) {
 		try {
@@ -802,7 +809,7 @@ uint8_t DiscordSync_OnServerInitialize()
 		if (res == 0)
 		{
 			OutputMessage(GREEN, "[MODULE]  ");
-			OutputMessage(WHITE, "Loaded DiscordSync v1.0 by habi\n");
+			OutputMessage(WHITE, "Loaded DiscordSync v1.0 [a] by habi\n");
 			//screen (application on linux) will print whatever is in LogMessageEx
 			//LogMessageEx("[MODULE]  Loaded DiscordSync v1.0 by habi");
 		}
