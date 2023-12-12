@@ -4,11 +4,6 @@
 #ifdef WIN32
 #include <Windows.h>
 #endif
-PluginFuncs* Server;
-PluginCallbacks* Callbacks;
-HSQAPI sq = NULL;
-HSQUIRRELVM v = NULL;
-HSQOBJECT container;
 #include <string.h>
 #include <string>
 #include <stdio.h>
@@ -16,15 +11,27 @@ HSQOBJECT container;
 #include <vector>
 #include "ReadCFG.h"
 #include <ctime>
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+PluginFuncs* Server;
+PluginCallbacks* Callbacks;
+HSQAPI sq = NULL;
+HSQUIRRELVM v = NULL;
+HSQOBJECT container;
+
 std::string Token="";
 std::string channelID="";
 std::string GatewayUrl = "wss://gateway.discord.gg/?v=10&encoding=json";
 std::string resumeURLAppend = "/?v=10&encoding=json";
 std::string HttpUrl = "https://discord.com/api/v10";
+bool bDebug = false;//debug is false
 int xrate_limit = 5;
 std::vector<unsigned int>tickarray;
 #ifdef WIN32
 HANDLE hstdout = NULL;//the console handle
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004	//old sdk
+#endif
 #endif
 
 #define INTENT 37377
@@ -52,13 +59,10 @@ HANDLE hstdout = NULL;//the console handle
 
 bool subscribed=false;//if yes, then a plugin command with message will be send when a message from discord arrives
 bool verbose = false;//if on, then every "Disconnected. Reconnecting.. " messages will be shown
-#include <nlohmann/json.hpp>
 
-using json = nlohmann::json;
-
-int hearbeat_interval = -1;
-unsigned last_hearbeat_send = 0;
-float heartbeat_3 = -1;
+long heartbeat_interval = -1;
+long last_hearbeat_send = 0;
+float heartbeat_ack_wait_time = -1;
 int sequence_number = -1;
 std::string resume_gateway_url = "";
 std::string session_id = "";
@@ -78,11 +82,12 @@ int still_running = 0;
 CURLM* multi_handle = NULL;
 bool first_time = true;
 unsigned int Uptime = 0;
+char DS_errbuf[CURL_ERROR_SIZE];
 int StartWebSocket(std::string url = GatewayUrl);
-void OutputMessage(int wattributes, const char* text);
+void DS_OutputMessage(int wattributes, const char* text);
 #ifndef WIN32
 #include <time.h>
-long GetTickCount()
+long DS_GetTickCount()
 {
 	struct timespec ts;
 	long theTick = 0U;
@@ -91,8 +96,10 @@ long GetTickCount()
 	theTick += ts.tv_sec * 1000;
 	return theTick;
 }
+#else
+long DS_GetTickCount() { return GetTickCount(); }
 #endif
-size_t write_data(void* buffer, size_t size, size_t nmemb, void* userp)
+size_t DS_write_data(void* buffer, size_t size, size_t nmemb, void* userp)
 {
 	struct curl_header* type;
 	CURL* easy = (CURL*)userp;
@@ -148,7 +155,16 @@ void cls(HANDLE hConsole)
 	SetConsoleCursorPosition(hConsole, csbi.dwCursorPosition);
 }
 #endif
-void LogMessageEx(const char* msg)
+std::string getTimePrefix()
+{
+	std::time_t t = std::time(0);   // get time now
+	std::tm* now = std::localtime(&t);
+	//22:07:51
+	std::string prefix = std::to_string(now->tm_hour) + ":" + std::to_string(now->tm_min) + ":" +
+		std::to_string(now->tm_sec) + " ";
+	return prefix;
+}
+void DS_LogMessageEx(const char* msg)
 {
 	std::string formattedMsg = std::string(msg);// +"\r" + std::string(len, '_');
 	size_t len = formattedMsg.length();
@@ -156,7 +172,7 @@ void LogMessageEx(const char* msg)
 	CONSOLE_SCREEN_BUFFER_INFO csb; 
 	GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csb);
 #else
-	printf("%c[?1049h",0x1b);//enables the alternative buffer
+	if(!bDebug)printf("%c[?1049h",0x1b);//enables the alternative buffer
 #endif
 	std::time_t t = std::time(0);   // get time now
 	std::tm* now = std::localtime(&t);
@@ -164,9 +180,10 @@ void LogMessageEx(const char* msg)
 	std::string prefix = std::to_string(now->tm_hour) + ":" + std::to_string(now->tm_min) + ":" +
 		std::to_string(now->tm_sec) + " ";
 	formattedMsg = prefix + formattedMsg;
-#ifndef WIN32
-#else
-	DWORD dwMode = NULL; bool bAlternateBuffer = false;
+#ifdef WIN32
+bool bAlternateBuffer = false;
+#ifndef DISABLE_ALTERNATE_BUFFER	
+	DWORD dwMode = 0; 
 	if (GetConsoleMode(
 		GetStdHandle(STD_OUTPUT_HANDLE),
 		&dwMode))
@@ -178,15 +195,24 @@ void LogMessageEx(const char* msg)
 		}
 	}
 #endif
+#endif
+#ifndef DISABLE_LOGTEXT
 	Server->LogMessage(formattedMsg.c_str());
+#else
+	//means server logging disabled. this must be for windows xp. so nothing is written on server_log.txt.
+	//however if debug is true, we want to print the messages. 
+#ifdef WIN32 //because in one print statement for linux already written ago.
+	if(bDebug)
+		Server->LogMessage(formattedMsg.c_str());
+#endif
+#endif
 #ifndef WIN32	
 	//screen defence - moves one line up and erase entire line
-	printf("%c[1A%c[2K", 0x1b, 0x1b);
+	if(!bDebug)printf("%c[1A%c[2K", 0x1b, 0x1b);
 
-	printf("%c[?1049l", 0x1b);;//disables the alternative buffer
+	if(!bDebug)printf("%c[?1049l", 0x1b);;//disables the alternative buffer
 	fflush(stdout);
-#endif
-#ifdef WIN32
+#else
 	if (bAlternateBuffer)
 	{
 		printf("%c[1A%c[2K", 0x1b, 0x1b);
@@ -194,6 +220,7 @@ void LogMessageEx(const char* msg)
 		printf("%c[?1049l", 0x1b);;//disables the alternative buffer
 		fflush(stdout);
 	}
+#ifndef DISABLE_SCREEN_ERASING
 	else {
 		int columns = csb.srWindow.Right - csb.srWindow.Left + 1;
 		int count = csb.dwCursorPosition.X; int r = 0;
@@ -238,16 +265,25 @@ void LogMessageEx(const char* msg)
 		}
 	}
 #endif
+#endif
 }
 
-void send_hearbeat(CURL* curl) {
+void send_heartbeat(CURL* curl) {
 	size_t sent; 
 	char buffer[512];
 	sprintf(buffer, "{\"op\":%d, \"d\":%s}", 1, sequence_number == -1 ? "null" : std::to_string(sequence_number).c_str());
 	CURLcode result = curl_ws_send(curl, (const void*)buffer, strlen(buffer), &sent, 0, CURLWS_TEXT);
 	//printf("result %d, sent %d\n", result, sent);
-	last_hearbeat_send = GetTickCount();
-	heartbeat_3 = 0;//waiting for ack. when ack received, it will be -1.
+	last_hearbeat_send = DS_GetTickCount();
+	heartbeat_ack_wait_time = 0;//waiting for ack. when ack received, it will be -1.
+	if (result != CURLE_OK)
+	{
+		DS_LogMessageEx((std::string("[DiscordSync] Could not send heartbeat. ") + std::to_string(result) ).c_str());
+	}
+	if(bDebug)
+	{
+		DS_LogMessageEx(buffer);
+	}
 }
 
 void send_identity(CURL* curl) {
@@ -271,14 +307,18 @@ void send_identity(CURL* curl) {
 	CURLcode result = curl_ws_send(curl, (const void*)buffer, strlen(buffer), &sent, 0, CURLWS_TEXT);
 	if (result != CURLE_OK)
 	{
-		Server->LogMessage("[Discord] Could not send identity. (%d)", result);
+		Server->LogMessage("[DiscordSync] Could not send identity. (%d)", result);
+	}
+	if (bDebug)
+	{
+		DS_LogMessageEx(buffer);
 	}
 }
 void send_Gateway_Resume_Event(CURL* curl) {
 	if (sequence_number == -1)
 	{
-		OutputMessage(RED, "[MODULE]  ");
-		OutputMessage(WHITE, "Cannot Resume.\n");
+		DS_OutputMessage(RED, "[MODULE]  ");
+		DS_OutputMessage(WHITE, "Cannot Resume.\n");
 	}
 	size_t sent;
 	char buffer[4096];
@@ -292,11 +332,14 @@ void send_Gateway_Resume_Event(CURL* curl) {
         }	\
     }	\
     ", 6, Token.c_str(), session_id.c_str(), sequence_number);
-	//LogMessageEx(buffer);
 	CURLcode result = curl_ws_send(curl, (const void*)buffer, strlen(buffer), &sent, 0, CURLWS_TEXT);
 	if (result != CURLE_OK)
 	{
 		Server->LogMessage("[Discord] Failed to resume. (%d)", result);
+	}
+	if (bDebug)
+	{
+		DS_LogMessageEx(buffer);
 	}
 }
 
@@ -314,7 +357,7 @@ const char* getANSIColorCode(int i)
 	default: return "";
 	}
 }
-void OutputMessage(int wattributes, const char* text)
+void DS_OutputMessage(int wattributes, const char* text)
 {	
 #ifdef WIN32
 	if (hstdout)
@@ -332,15 +375,14 @@ void OutputMessage(int wattributes, const char* text)
 	printf("%c[%s%sm%s%c[0m", 27, (wattributes&8)==8?"1;":"", getANSIColorCode(wattributes&(~8)), text, 27);
 
 #endif
-	//if (file) { fputs(text, file); }
 }
 
 
 
 //return 0 on successfully adding easy handle to multi handle
-int send_message(const std::string& message) {
+int DS_send_message(const std::string& message) {
 	//Check if rate limit is reached..?
-	unsigned int dwNow = GetTickCount();
+	unsigned int dwNow = DS_GetTickCount();
 
 	//Remove all that happened before 1000 ms.
 	while (tickarray.size() > 0)
@@ -354,11 +396,11 @@ int send_message(const std::string& message) {
 	if (xrate_limit > 0 && tickarray.size() >= xrate_limit) //'>' is not necessary.
 	{
 		//Rate limit reached. cannot send message.
-		OutputMessage(YELLOW, "[MODULE] ");
+		DS_OutputMessage(YELLOW, "[MODULE] ");
 		char msg[128];
 		sprintf(msg, "Message not send. %d/%d already send per second.\n", (int)tickarray.size(),
 			xrate_limit);
-		OutputMessage(WHITE, msg);
+		DS_OutputMessage(WHITE, msg);
 
 		return -1;
 	}
@@ -371,6 +413,10 @@ int send_message(const std::string& message) {
     }	\
     ",
 		message.c_str());
+	if (bDebug)
+	{
+		DS_LogMessageEx(buffer);
+	}
 	CURL* easy_handle = curl_easy_init();
 	
 	if(easy_handle)
@@ -382,20 +428,23 @@ int send_message(const std::string& message) {
 		curl_easy_setopt(easy_handle, CURLOPT_URL, url.c_str());
 		curl_easy_setopt(easy_handle, CURLOPT_HTTPHEADER, headers);
 		curl_easy_setopt(easy_handle, CURLOPT_COPYPOSTFIELDS, buffer);
-		curl_easy_setopt(easy_handle, CURLOPT_WRITEFUNCTION, write_data);
+		curl_easy_setopt(easy_handle, CURLOPT_WRITEFUNCTION, DS_write_data);
 		curl_easy_setopt(easy_handle, CURLOPT_WRITEDATA, easy_handle);
+#ifdef DONOT_SSL_VERIFY_PEER
+		curl_easy_setopt(easy_handle, CURLOPT_SSL_VERIFYPEER, FALSE);
+#endif
 		CURLMcode result=curl_multi_add_handle(multi_handle, easy_handle);
 		if (result != CURLM_OK)
 		{
 			std::string msg = std::string("DiscordSync: Failed on ( curl_multi_add_handle ) (") + std::to_string(result) + std::string(")\n");
-			OutputMessage(RED, msg.c_str());
+			DS_OutputMessage(RED, msg.c_str());
 			return result;
 		}
 		result=curl_multi_perform(multi_handle, &still_running);
 		if (result != CURLM_OK)
 		{
 			std::string msg = std::string("DiscordSync: Failed on ( curl_multi_perform ) (") + std::to_string(result)+std::string(")\n");
-			OutputMessage(RED, msg.c_str());
+			DS_OutputMessage(RED, msg.c_str());
 			return result;
 		}
 		tickarray.push_back(dwNow);
@@ -403,7 +452,7 @@ int send_message(const std::string& message) {
 		//OnServerFrame will work the rest of code
 	}else 
 	{
-		OutputMessage(RED,"DiscordSync: Failed on ( curl_easy_init )\n");
+		DS_OutputMessage(RED,"DiscordSync: Failed on ( curl_easy_init )\n");
 		return -1;
 	}
 }
@@ -413,14 +462,14 @@ SQInteger fn_SendMessage(HSQUIRRELVM v)
 	{
 		const SQChar* message;
 		sq->getstring(v, 2, &message);
-		int res = send_message(message);
+		int res = DS_send_message(message);
 	}
 	else if (!error_msg_shown)
 	{
-		OutputMessage(YELLOW, "[MODULE]  ");
+		DS_OutputMessage(YELLOW, "[MODULE]  ");
 		char msg[128];
 		sprintf(msg, "Cannot send message when disconnected. Use 0x%x to reconnect\n", CMD_RECONNECT);
-		OutputMessage(WHITE,msg );
+		DS_OutputMessage(WHITE,msg );
 		error_msg_shown = true;
 	}
 	return 0;
@@ -431,18 +480,22 @@ void DiscordSync_CloseConnection()
 	//bsend_identity = false;
 	bsend_gateway_resume_event = false;
 	resuming = false;
-	hearbeat_interval = -1;
+	heartbeat_interval = -1;
 	hello_received = false;
 	//sequence_number = -1;
 	error_msg_shown = false;
 	error_msg_shown_plgncmd = false;
 	first_time = false;//To show 'reconnected' msg
-	heartbeat_3 = -1;
+	heartbeat_ack_wait_time = -1;
 	if (gateway_easy)
 	{
 		curl_multi_remove_handle(multi_handle, gateway_easy);
 		curl_easy_cleanup(gateway_easy);
 		gateway_easy = NULL;
+	}
+	if (bDebug)
+	{
+		DS_LogMessageEx("DiscordSync_CloseConnection was called");
 	}
 }
 static int recv_any(CURL* curl) {
@@ -456,11 +509,11 @@ static int recv_any(CURL* curl) {
 		{
 		if (result == CURLE_GOT_NOTHING)
 		{
-			LogMessageEx("[DiscordSync] Disconnected. (CURLE_GOT_NOTHING)");
+			DS_LogMessageEx("[DiscordSync] Disconnected. (CURLE_GOT_NOTHING)");
 			if (verbose) 
 			{
-				OutputMessage(RED, "[MODULE] ");
-				OutputMessage(WHITE, "Connection closed. Disconnected. ");
+				DS_OutputMessage(RED, "[MODULE] ");
+				DS_OutputMessage(WHITE, "Connection closed. Disconnected. ");
 			}
 			DiscordSync_CloseConnection(); 
 			Server->SendPluginCommand(CMD_ON_DISCONNECT, ""); 
@@ -469,13 +522,13 @@ static int recv_any(CURL* curl) {
 			{
 				Server->SendPluginCommand(CMD_RESUME, "");
 				if(verbose)
-					OutputMessage(YELLOW, "Trying to resume..\n");
+					DS_OutputMessage(YELLOW, "Trying to resume..\n");
 			}
 			else
 			{
 				Server->SendPluginCommand(CMD_RECONNECT, "");
 				if(verbose)
-					OutputMessage(YELLOW, "Reconnecting..\n");
+					DS_OutputMessage(YELLOW, "Reconnecting..\n");
 			}
 			
 			return result;//curl handle null. so return
@@ -487,10 +540,10 @@ static int recv_any(CURL* curl) {
 				errmsg = "Failed in receiving network data. ";
 			else 
 				errmsg= std::string("Error occurred in recv_any. CURLcode: ") + std::to_string(result) + ". ";
-			OutputMessage(RED, "[MODULE]");
-			OutputMessage(WHITE, errmsg.c_str());
-			OutputMessage(WHITE, "Disconnected.\n");
-			LogMessageEx((std::string("[DiscordSync] Disconnected ") + std::to_string(result)).c_str());
+			DS_OutputMessage(RED, "[MODULE]");
+			DS_OutputMessage(WHITE, errmsg.c_str());
+			DS_OutputMessage(WHITE, "Disconnected.\n");
+			DS_LogMessageEx((std::string("[DiscordSync] Disconnected ") + std::to_string(result)).c_str());
 			DiscordSync_CloseConnection(); 
 			Server->SendPluginCommand(CMD_ON_DISCONNECT, ""); 
 			return result;//curl handle null. so return
@@ -501,9 +554,11 @@ static int recv_any(CURL* curl) {
 	total_len+=rlen;
 	}
 	while(meta->bytesleft>0);
-    
+
 	bool resumable;
 	if (meta->flags & CURLWS_TEXT) {
+		if (bDebug)
+			DS_LogMessageEx(data.c_str());
 		try {
 			json jsonData = json::parse(data);
 			std::string jsonString = jsonData.dump(4);
@@ -515,9 +570,9 @@ static int recv_any(CURL* curl) {
 					hello_received = true;
 
 					if (jsonData.contains("d") && jsonData["d"].contains("heartbeat_interval")) {
-						int heartbeat_interval = jsonData["d"]["heartbeat_interval"];
-						hearbeat_interval = heartbeat_interval;
-						send_hearbeat(curl);
+						long intvl = jsonData["d"]["heartbeat_interval"];
+						heartbeat_interval = intvl;
+						send_heartbeat(curl);
 					}
 					/*If we have resume_connection, then gateway respond with opcode 10
 					{"t":null,"s":null,"op":10,"d":{"heartbeat_interval":41250,"_trace":["[\"gateway-prd-us-east1-c-6cgd\",{\"micros\":0.0}]"]}}
@@ -530,14 +585,14 @@ static int recv_any(CURL* curl) {
 					break;
 				case 9://Invalid Section
 					resumable = jsonData["d"]; 
-					LogMessageEx("[DiscordSync] Invalid Session");
-					OutputMessage(RED, "[MODULE]  ");
-					OutputMessage(WHITE, "Disconnected.");
+					DS_LogMessageEx("[DiscordSync] Invalid Session");
+					DS_OutputMessage(RED, "[MODULE]  ");
+					DS_OutputMessage(WHITE, "Disconnected.");
 					websocket_close(curl);
 					DiscordSync_CloseConnection();
 					if (resumable == true)
 					{
-						OutputMessage(WHITE, "Resuming..\n");
+						DS_OutputMessage(WHITE, "Resuming..\n");
 						StartWebSocket(resume_gateway_url);
 						resuming = true;
 					}
@@ -553,10 +608,10 @@ static int recv_any(CURL* curl) {
 					{
 //The most common message. If in windows, log it (it won't print on screen)
 #ifdef WIN32
-						LogMessageEx("[DiscordSync]Reconnect instruction received");
+						DS_LogMessageEx("[DiscordSync]Reconnect instruction received");
 #endif
-						OutputMessage(RED, "[MODULE]  ");
-						OutputMessage(WHITE, "Disconnected. Resuming..\n");
+						DS_OutputMessage(RED, "[MODULE]  ");
+						DS_OutputMessage(WHITE, "Disconnected. Resuming..\n");
 					}
 					websocket_close(curl);
 					DiscordSync_CloseConnection();
@@ -566,10 +621,10 @@ static int recv_any(CURL* curl) {
 					break;
 				case 11:
 					//printf("Heartbeat ACK (opcode 11) received\n");
-					heartbeat_3 = -1;//ack received
+					heartbeat_ack_wait_time = -1;//ack received
 					break;
 				case 1:
-					send_hearbeat(curl);
+					send_heartbeat(curl);
 					break;
 				case 0:
 					// Handle Dispatch event (various event types)
@@ -671,18 +726,18 @@ static int recv_any(CURL* curl) {
 								{
 									if (verbose)
 									{
-										OutputMessage(GREEN, "[MODULE]  ");
-										OutputMessage(WHITE, "Reconnected.\n");
+										DS_OutputMessage(GREEN, "[MODULE]  ");
+										DS_OutputMessage(WHITE, "Reconnected.\n");
 									}
-									LogMessageEx("[DiscordSync]: Reconnected to Discord");
+									DS_LogMessageEx("[DiscordSync]: Reconnected to Discord");
 								}
 								else {
 									first_time = false;
-									LogMessageEx("[DiscordSync]: Connected to Discord");
+									DS_LogMessageEx("[DiscordSync]: Connected to Discord");
 								}
-								Uptime = GetTickCount();
-								LogMessageEx(("[DiscordSync] Resume URL: " + resume_gateway_url).c_str());
-								LogMessageEx(("[DiscordSync] Session id: " + session_id).c_str());
+								Uptime = DS_GetTickCount();
+								DS_LogMessageEx(("[DiscordSync] Resume URL: " + resume_gateway_url).c_str());
+								DS_LogMessageEx(("[DiscordSync] Session id: " + session_id).c_str());
 								Server->SendPluginCommand(CMD_ONCONNECT, "");
 							}
 						}
@@ -690,10 +745,10 @@ static int recv_any(CURL* curl) {
 						{
 							if (verbose)
 							{
-								OutputMessage(GREEN, "[MODULE]  ");
-								OutputMessage(WHITE, "Reconnected.\n");
+								DS_OutputMessage(GREEN, "[MODULE]  ");
+								DS_OutputMessage(WHITE, "Reconnected.\n");
 							}
-							LogMessageEx("[DiscordSync]: Resumed to Discord");
+							DS_LogMessageEx("[DiscordSync]: Resumed to Discord");
 							resuming = false;//done with it
 						}
 						// Add more cases for other event types as needed.
@@ -703,27 +758,29 @@ static int recv_any(CURL* curl) {
 					break;
 				default:
 					// Handle other opcodes or events
-					LogMessageEx(("Unhandled opcode " + std::to_string(opcode) + " received").c_str());
+					DS_LogMessageEx(("Unhandled opcode " + std::to_string(opcode) + " received").c_str());
 					break;
 				}
 			}
 		}
 		catch (const json::parse_error& e) {
 			// Handle the parsing error as needed
-			LogMessageEx((std::string("DiscordSync: JSON parsing error: ")+ e.what()).c_str());
-			LogMessageEx(data.c_str());			
+			DS_LogMessageEx((std::string("DiscordSync: JSON parsing error: ")+ e.what()).c_str());
+			DS_LogMessageEx(data.c_str());			
 		}
 	}
 	else if (meta->flags & CURLWS_CLOSE) {
-	OutputMessage(RED, "[MODULE]  ");
+		if (bDebug)
+			DS_LogMessageEx((std::string("meta->flags: ") + std::to_string(meta->flags)).c_str());
+	DS_OutputMessage(RED, "[MODULE]  ");
 	if (bsend_identity && botId == "")
 	{
 		//Probably the token was invalid
-		OutputMessage(WHITE, "Gateway connection closed. Invalid token?\n");
+		DS_OutputMessage(WHITE, "Gateway connection closed. Invalid token?\n");
 	}
 	else
-		OutputMessage(WHITE, "Gateway connection closed. Disconnected.\n");
-	LogMessageEx("[DiscordSync] Gateway connection closed.");
+		DS_OutputMessage(WHITE, "Gateway connection closed. Disconnected.\n");
+	DS_LogMessageEx("[DiscordSync] Gateway connection closed.");
 	DiscordSync_CloseConnection();
 	Server->SendPluginCommand(CMD_ON_DISCONNECT, "");
 		//exit(0);
@@ -744,6 +801,8 @@ static void websocket_close(CURL* curl)
 		size_t sent;
 		(void)curl_ws_send(curl, "", 0, &sent, 0, CURLWS_CLOSE);
 	}
+	if (bDebug)
+		DS_LogMessageEx("websocket_close");
 }
 
 
@@ -755,38 +814,39 @@ int StartWebSocket(std::string url) {
 	if (gateway_easy) {
 		curl_easy_setopt(gateway_easy, CURLOPT_URL, url.c_str());
 		curl_easy_setopt(gateway_easy, CURLOPT_CONNECT_ONLY, 2L); /* websocket style */
+		/* provide a buffer to store errors in */
+		curl_easy_setopt(gateway_easy, CURLOPT_ERRORBUFFER, DS_errbuf);
+#ifdef DONOT_SSL_VERIFY_PEER
+		curl_easy_setopt(gateway_easy, CURLOPT_SSL_VERIFYPEER, FALSE);
+#endif
+		/* set the error buffer as empty before performing a request */
+		DS_errbuf[0] = 0;
 
 		if (!multi_handle)
 		{
-			LogMessageEx("DiscordSync: Error (Multihandle not ready)");
+			DS_LogMessageEx("DiscordSync: Error (Multihandle not ready)");
 			return -1;
 		}
 		CURLMcode result = curl_multi_add_handle(multi_handle, gateway_easy);
 		if (result != CURLM_OK)
 		{
 			std::string msg = std::string("DiscordSync: Failed on ( curl_multi_add_handle ) (") + std::to_string(result) + std::string(")");
-			LogMessageEx(msg.c_str());
+			DS_LogMessageEx(msg.c_str());
 			return result;
 		}
 		result = curl_multi_perform(multi_handle, &still_running);
 		if (result != CURLM_OK)
 		{
 			std::string msg = std::string("DiscordSync: Failed on ( curl_multi_perform ) (") + std::to_string(result) + std::string(")");
-			LogMessageEx(msg.c_str());
+			DS_LogMessageEx(msg.c_str());
 			return result;
 		}
+		if (bDebug)
+			DS_LogMessageEx("StartWebsocket in progress");
 		return 0;
-		/*if (res != CURLE_OK)
-			fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-		else {
-			/* connected and ready 
-			websocket(curl);
-		}
-
-		curl_easy_cleanup(curl);*/
 	}
 	else {
-		LogMessageEx("DiscordSync: Failed ( curl_easy_init ) (gateway_easy)");
+		DS_LogMessageEx("DiscordSync: Failed ( curl_easy_init ) (gateway_easy)");
 		return -1;
 	}
 }
@@ -808,23 +868,24 @@ uint8_t DiscordSync_OnServerInitialize()
 		int res = StartWebSocket();
 		if (res == 0)
 		{
-			OutputMessage(GREEN, "[MODULE]  ");
-			OutputMessage(WHITE, "Loaded DiscordSync v1.0 [a] by habi\n");
+			DS_OutputMessage(GREEN, "[MODULE]  ");
+			DS_OutputMessage(WHITE, "Loaded DiscordSync v1.1 by habi\n");
+			
 			//screen (application on linux) will print whatever is in LogMessageEx
 			//LogMessageEx("[MODULE]  Loaded DiscordSync v1.0 by habi");
 		}
 		else
 		{
-			OutputMessage(RED, "[MODULE]  ");
-			OutputMessage(WHITE, "Some error occured while starting discordsync. Not connected.\n");
+			DS_OutputMessage(RED, "[MODULE]  ");
+			DS_OutputMessage(WHITE, "Some error occured while starting discordsync. Not connected.\n");
 		}
 		
 	}
 	else
 	{
-		LogMessageEx("[DiscordSync] Unable to start socket");
-		OutputMessage(RED, "[MODULE]  ");
-		OutputMessage(WHITE, "Unable to start discordsync\n");
+		DS_LogMessageEx("[DiscordSync] Unable to start socket");
+		DS_OutputMessage(RED, "[MODULE]  ");
+		DS_OutputMessage(WHITE, "Unable to start discordsync\n");
 	}
 	return 1;
 }
@@ -839,7 +900,7 @@ void DiscordSync_OnServerFrame(float elapsedTime)
 		{
 			std::string msg = std::string("[DiscordSync] Failed ( curl_multi_perform ) Code: ") + std::to_string(mresult);
 			//Server->LogMessage("DiscordSync: %s",msg.c_str()); 
-			LogMessageEx(msg.c_str());
+			DS_LogMessageEx(msg.c_str());
 		}
 
 		struct CURLMsg* m; 
@@ -863,18 +924,18 @@ void DiscordSync_OnServerFrame(float elapsedTime)
 					//Server->LogMessage("DiscordSync: failed on handle: %p CURLcode: %d\r", e, result); 
 					
 					char msg[256]; char msg2[256];
-					sprintf(msg, "DiscordSync: failed on handle: %p CURLcode: %d", e, result);
-					LogMessageEx(msg);
+					sprintf(msg, "DiscordSync: failed on handle: %p CURLcode: %d %s", e, result,DS_errbuf);
+					DS_LogMessageEx(msg);
 
 					if (e == gateway_easy)
-						OutputMessage(RED, "[MODULE]  ");
+						DS_OutputMessage(RED, "[MODULE]  ");
 					else
-						OutputMessage(YELLOW, "[MODULE]  ");
+						DS_OutputMessage(YELLOW, "[MODULE]  ");
 					sprintf(msg2, "%s discordsync. Status: %s.\n",
 						result == CURLE_COULDNT_RESOLVE_HOST ? "Couldn't resolve host," :
 						"Error occured in",
 						websocket_initialized ? "Not disconnected yet" : "Disconnected");
-					OutputMessage(WHITE, msg2);
+					DS_OutputMessage(WHITE, msg2);
 					//No reconnect.
 				}
 				//Remove the easy handle
@@ -884,7 +945,7 @@ void DiscordSync_OnServerFrame(float elapsedTime)
 					if (mresult != CURLM_OK)
 					{
 						std::string msg = "Error while curl_multi_remove_handle. CURLMcode: " + std::to_string(mresult);
-						LogMessageEx(msg.c_str());
+						DS_LogMessageEx(msg.c_str());
 					}
 				}
 				//Cleanup the easy handle. 
@@ -913,24 +974,24 @@ void DiscordSync_OnServerFrame(float elapsedTime)
 	{
 		recv_any(gateway_easy);
 
-		if (hearbeat_interval != -1 && (GetTickCount() - last_hearbeat_send) > hearbeat_interval) {
-			send_hearbeat(gateway_easy);
+		if (heartbeat_interval != -1 && (DS_GetTickCount() - last_hearbeat_send) > heartbeat_interval) {
+			send_heartbeat(gateway_easy);
 		}
 		if (hello_received && !bsend_identity &&!resuming) {
 			send_identity(gateway_easy);
 			bsend_identity = true;
 		}
-		if (heartbeat_3 != -1)
+		if (heartbeat_ack_wait_time != -1)
 		{
 			//Means an ack is awaited.
-			if (heartbeat_3 > 10.000)//10 seconds
+			if (heartbeat_ack_wait_time > 10.000)//10 seconds
 			{
 				//We waited 10 seconds and no ack received.
-				LogMessageEx("[DiscordSync] Reconnecting since heartbeat ack was not received");
+				DS_LogMessageEx("[DiscordSync] Reconnecting since heartbeat ack was not received");
 				Server->SendPluginCommand(CMD_RECONNECT, "RESUME");
 				
 			}
-			else heartbeat_3 += elapsedTime;
+			else heartbeat_ack_wait_time += elapsedTime;
 		}
 		
 	}
@@ -990,14 +1051,14 @@ uint8_t DiscordSync_OnPluginCommand(uint32_t commandIdentifier, const char* mess
 		{
 			websocket_close(gateway_easy);
 			DiscordSync_CloseConnection();
-			OutputMessage(RED, "[MODULE]  ");
-			OutputMessage(WHITE, "Disconnected.\n");
-			LogMessageEx("[DiscordSync] Disconnected by self.");
+			DS_OutputMessage(RED, "[MODULE]  ");
+			DS_OutputMessage(WHITE, "Disconnected.\n");
+			DS_LogMessageEx("[DiscordSync] Disconnected by self.");
 			Server->SendPluginCommand(CMD_ON_DISCONNECT, "");
 		}
 		else if(!error_msg_shown_plgncmd) {
-			OutputMessage(YELLOW, "[MODULE]  ");
-			OutputMessage(WHITE, "Not connected\n"); 
+			DS_OutputMessage(YELLOW, "[MODULE]  ");
+			DS_OutputMessage(WHITE, "Not connected\n"); 
 			error_msg_shown_plgncmd = true;
 		}
 	}
@@ -1016,13 +1077,13 @@ uint8_t DiscordSync_OnPluginCommand(uint32_t commandIdentifier, const char* mess
 	}
 	else if (commandIdentifier == CMD_LOGMSGEX)
 	{
-		LogMessageEx(message);
+		DS_LogMessageEx(message);
 	}
 	else if (commandIdentifier == CMD_SHOWUPTIME)
 	{
 		if (websocket_initialized)
 		{
-			unsigned int now = GetTickCount();
+			unsigned int now = DS_GetTickCount();
 			long elapsed = (long)now - (long)Uptime;
 			if (elapsed > 0)
 			{
@@ -1035,15 +1096,15 @@ uint8_t DiscordSync_OnPluginCommand(uint32_t commandIdentifier, const char* mess
 				str += std::to_string(minutes) + " minutes, ";
 				str += std::to_string(seconds) + " seconds.\n";
 
-				OutputMessage(GREEN, "[MODULE]  ");
-				OutputMessage(WHITE, "Uptime: ");
-				OutputMessage(WHITE, str.c_str());
+				DS_OutputMessage(GREEN, "[MODULE]  ");
+				DS_OutputMessage(WHITE, "Uptime: ");
+				DS_OutputMessage(WHITE, str.c_str());
 			}
 		}
 		else
 		{
-			OutputMessage(YELLOW, "[MODULE]  ");
-			OutputMessage(WHITE, "Not connected\n");
+			DS_OutputMessage(YELLOW, "[MODULE]  ");
+			DS_OutputMessage(WHITE, "Not connected\n");
 		}
 	}
 	else if (commandIdentifier == CMD_RESUME)
@@ -1059,20 +1120,20 @@ uint8_t DiscordSync_OnPluginCommand(uint32_t commandIdentifier, const char* mess
 			else {
 				char msg[128];
 				sprintf(msg, "Resume not possible. Try 0x%x\n", CMD_RECONNECT);
-				OutputMessage(YELLOW, "[MODULE]  ");
-				OutputMessage(WHITE, msg);
+				DS_OutputMessage(YELLOW, "[MODULE]  ");
+				DS_OutputMessage(WHITE, msg);
 			}
 		}
 		else {
-			OutputMessage(YELLOW, "[MODULE]  ");
-			OutputMessage(WHITE, "First disconnect to resume.\n");
+			DS_OutputMessage(YELLOW, "[MODULE]  ");
+			DS_OutputMessage(WHITE, "First disconnect to resume.\n");
 		}
 	}
 	else if (commandIdentifier == CMD_STATUS)
 	{
-		OutputMessage(websocket_initialized?GREEN:RED, "[MODULE]  ");
-		OutputMessage(WHITE, "Status: ");
-		websocket_initialized ? OutputMessage(WHITE, "Connected\n") : OutputMessage(WHITE, "Disconnected\n");
+		DS_OutputMessage(websocket_initialized?GREEN:RED, "[MODULE]  ");
+		DS_OutputMessage(WHITE, "Status: ");
+		websocket_initialized ? DS_OutputMessage(WHITE, "Connected\n") : DS_OutputMessage(WHITE, "Disconnected\n");
 	}
 	else if (commandIdentifier == CMD_CHANNEL)
 	{
@@ -1094,14 +1155,14 @@ uint8_t DiscordSync_OnPluginCommand(uint32_t commandIdentifier, const char* mess
 	{
 		if (websocket_initialized)
 		{
-			send_message(message);
+			DS_send_message(message);
 		}
 		else if (!error_msg_shown &&!shutting_down)
 		{
-			OutputMessage(YELLOW, "[MODULE]  ");
+			DS_OutputMessage(YELLOW, "[MODULE]  ");
 			char msg[128];
 			sprintf(msg, "Status: Disconnected. Use 0x%x to reconnect\n", CMD_RECONNECT);
-			OutputMessage(WHITE, msg);
+			DS_OutputMessage(WHITE, msg);
 		}
 	}
 	else if (commandIdentifier == CMD_VERBOSE)
@@ -1156,8 +1217,8 @@ extern "C"  unsigned int VcmpPluginInit(PluginFuncs * pluginFuncs, PluginCallbac
 		Token=std::string(szValue);
 	}else 
 	{
-		OutputMessage(RED, "[MODULE]  ");
-		OutputMessage(WHITE, "DiscordSync : token not found in server.cfg\n");
+		DS_OutputMessage(RED, "[MODULE]  ");
+		DS_OutputMessage(WHITE, "DiscordSync : token not found in server.cfg\n");
 		return 0;
 	}
 	botToken.freememory();
@@ -1172,8 +1233,8 @@ extern "C"  unsigned int VcmpPluginInit(PluginFuncs * pluginFuncs, PluginCallbac
 		channelID=std::string(szValue);
 	}else
 	{
-		OutputMessage(RED, "[MODULE]  ");
-		OutputMessage(WHITE, "DiscordSync : channel not found in server.cfg\n");
+		DS_OutputMessage(RED, "[MODULE]  ");
+		DS_OutputMessage(WHITE, "DiscordSync : channel not found in server.cfg\n");
 		return 0;
 	}
 	channel.freememory();
@@ -1199,142 +1260,18 @@ extern "C"  unsigned int VcmpPluginInit(PluginFuncs * pluginFuncs, PluginCallbac
 		HttpUrl = std::string(szValue);
 	}
 	discordhttp.freememory();
+	
+	cfg debug;
+	debug.read("server.cfg", "debug");
+	if (debug.argc > 0)
+	{
+		szValue = debug.ptr[0];
+		std::string szdebug = std::string(szValue);
+		if (szdebug == "true" || szdebug == "1")
+		{
+			bDebug = true;
+			DS_LogMessageEx("[DiscordSync]debug true in server.cfg. Will print additional messages");
+		}
+	}
 	return 1;
 }
-
-/*
-
-size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata)
-{
-	size_t retvalue = size * nmemb; int top = sq->gettop(v);
-	sq->pushobject(v, *(HSQOBJECT*)userdata);
-	SQObjectType type= sq->gettype(v, -1);
-	if (type != OT_CLOSURE && type != OT_NATIVECLOSURE)
-	{
-		printf("DiscordSync: Unknown error (The value of internal pointer is not function)\n");
-		sq->settop(v, top);
-		return CURL_WRITEFUNC_ERROR;
-	}
-	sq->pushroottable(v);
-	char* str = (char*)calloc(size * nmemb + 1, sizeof(char));
-	if (str)
-	{
-		memcpy(str, ptr, size * nmemb);
-		//*(str + size * nmemb) = '\0';
-		sq->pushstring(v, str, -1);
-		if (SQ_FAILED(sq->call(v, 2, 1, 1)))
-		{
-			sq->getlasterror(v);
-			const SQChar* error;
-			if (SQ_SUCCEEDED(sq->getstring(v, -1, &error)))
-			{
-				printf("DiscordSync: calling closure (@write_callback) failed. Reason: %s\n", error);
-			}
-			else printf("DiscordSync: calling closure (@write_callback) failed\n");
-			sq->settop(v, top);
-			return CURL_WRITEFUNC_ERROR;
-		}
-		free(str);
-	}
-	else printf("DiscordSync: calloc error on write_callback\n");
-	
-	return retvalue;
-}
-
-SQInteger fn_SendRequest(HSQUIRRELVM v)
-{
-	int top = sq->gettop(v); 
-	const SQChar* url;
-	sq->getstring(v, 2, &url);
-	CURL *easy = curl_easy_init();
-	if(easy) {
-  	CURLcode res;
-  	res=curl_easy_setopt(easy, CURLOPT_URL, url);
-	if (top == 4)
-	{
-		if (sq->gettype(v, 4) == OT_STRING)
-		{
-			const SQChar* certpath;
-			if (SQ_SUCCEEDED(sq->getstring(v, 4, &certpath)))
-			{
-				curl_easy_setopt(easy, CURLOPT_CAINFO, certpath);
-			}
-			else return sq->throwerror(v, "Error getting string");
-		}
-		else return sq->throwerror(v, "DiscordSync: Path to certificate must be string");
-	}
-	if (res != CURLE_OK)
-	{
-		std::string msg = "Error while curl_easy_setopt. Code: " + res;
-		return sq->throwerror(v, msg.c_str() );
-	}
-	//Create a userdata of size of HSQOBJECT. It will be pushed in stack
-	HSQOBJECT* pointer = (HSQOBJECT*)sq->newuserdata(v, sizeof(HSQOBJECT));
-	sq->resetobject(pointer);
-	//Get function at index 3
-	if (SQ_SUCCEEDED(sq->getstackobj(v, 3, pointer)))
-	{
-		sq->newarray(v, 0);
-		sq->push(v, 3);//the function 
-		if (SQ_FAILED(sq->arrayappend(v, -2)))
-		{
-			return sq->throwerror(v, "Error while storing function");
-		}
-		//Now at -1 we have array and -2 we have userdata
-		sq->push(v, -2 );//Push the userdata
-		//Now at -1 we have userdata, -2 array and -3 userdata(same)
-		sq->remove(v, -3);//Remove userdata (copy)
-		if (SQ_FAILED(sq->arrayappend(v, -2)))
-		{
-			return sq->throwerror(v, "Error while storing pointer");
-		}
-		//Now the array have both function and userdata. Unless array is deleted, its
-		//members will not be removed by squirrel when cleaning.
-
-
-		//copy the userdata in our HSQOBJECT container in multiple steps
-		sq->pushobject(v, container);
-		//Now at -1 container array and -2 array
-		sq->push(v, -2);//the array which holds two items (function,userdata)
-		//Stack now, -1 array, -2 container, -3 array (same),
-		sq->remove(v, -3);//Remove the array (copy)
-		if (SQ_FAILED(sq->arrayappend(v, -2)))
-		{
-			return sq->throwerror(v, "Error while storing function and pointer");
-		}
-		sq->pop(v, 1);//the container array. It has reference added earlier 
-		res=curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_callback);
-		if (res != CURLE_OK)
-		{
-			std::string msg = "Error while curl_easy_setopt. WRITEFUNCTION. Code: " + res;
-			return sq->throwerror(v, msg.c_str());
-		}
-		res=curl_easy_setopt(easy, CURLOPT_WRITEDATA, pointer);
-		if (res != CURLE_OK)
-		{
-			std::string msg = "Error while curl_easy_setopt. WRITEDATA. Code: " + res;
-			return sq->throwerror(v, msg.c_str());
-		}
-	}
-	else {
-		return sq->throwerror(v, "Error getting function");
-	}
-	CURLMcode result=curl_multi_add_handle(multi_handle, easy);
-	if (result != CURLM_OK)
-	{
-		std::string msg = "Error when curl_multi_add_handle. Code: " + result;
-		return sq->throwerror(v, msg.c_str());
-	}
-	result=curl_multi_perform(multi_handle, &still_running);
-	if (result != CURLM_OK)
-	{
-		std::string msg = "Error when curl_multi_perform. Code: " + result;
-		return sq->throwerror(v, msg.c_str());
-	}
-	return 0;
-	//OnServerFrame will work the rest of code
-	}
-	else return sq->throwerror(v, "DiscordSync: curl easy_init failed");
-}
-
-*/
